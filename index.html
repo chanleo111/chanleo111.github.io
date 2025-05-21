@@ -7,13 +7,13 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/moment@2.29.1/moment.min.js"></script>
 </head>
 <body class="bg-gray-100">
     <div id="root"></div>
-    <script type="text/babel">
+    <script type="text/babel" data-presets="react">
         const { useState, useEffect } = React;
 
         const COINGECKO_API_BASE = "https://api.coingecko.com/api/v3";
@@ -29,8 +29,8 @@
             const [chartTicker, setChartTicker] = useState("");
             const [chartData, setChartData] = useState(null);
             const [coins, setCoins] = useState(null);
+            const [showSettings, setShowSettings] = useState(false);
 
-            // 初始化 CoinGecko 貨幣對
             useEffect(() => {
                 fetch(`${COINGECKO_API_BASE}/coins/list`)
                     .then(res => res.json())
@@ -44,19 +44,34 @@
                     .catch(err => addLog(`獲取貨幣對錯誤: ${err}`));
             }, []);
 
-            // 保存資產到 localStorage
             useEffect(() => {
                 localStorage.setItem("assets", JSON.stringify(assets));
             }, [assets]);
 
-            // 監聽資產
             useEffect(() => {
                 let interval;
                 if (isMonitoring && coins) {
-                    interval = setInterval(() => monitorAssets(), 30000);
+                    interval = setInterval(() => monitorAssets(), 60000); // 改為 60 秒
                 }
                 return () => clearInterval(interval);
             }, [isMonitoring, coins]);
+
+            useEffect(() => {
+                const canvas = document.getElementById("priceChart");
+                if (canvas && chartData) {
+                    new Chart(canvas, {
+                        type: "line",
+                        data: chartData,
+                        options: {
+                            scales: {
+                                y: {
+                                    beginAtZero: false
+                                }
+                            }
+                        }
+                    });
+                }
+            }, [chartData]);
 
             const addLog = (message) => {
                 const timestamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" });
@@ -67,9 +82,13 @@
                 if (!coins || !coins[ticker]) return null;
                 try {
                     const res = await fetch(`${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`);
+                    if (res.status === 429) {
+                        addLog(`CoinGecko API 配額超限，請稍後重試`);
+                        return null;
+                    }
                     const data = await res.json();
-                    await new Promise(resolve => setTimeout(resolve, 2000)); // 遵守配額
-                    return data[coins[ticker]]?.usd || null;
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    return data[coins[ticker]] && data[coins[ticker]].usd ? data[coins[ticker]].usd : null;
                 } catch (err) {
                     addLog(`獲取 ${ticker} 價格錯誤: ${err}`);
                     return null;
@@ -80,6 +99,10 @@
                 if (!coins || !coins[ticker]) return [];
                 try {
                     const res = await fetch(`${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=${days}&interval=daily`);
+                    if (res.status === 429) {
+                        addLog(`CoinGecko API 配額超限，請稍後重試`);
+                        return [];
+                    }
                     const data = await res.json();
                     await new Promise(resolve => setTimeout(resolve, 2000));
                     return data.prices.map(([ts, price]) => ({
@@ -96,7 +119,11 @@
                 const data = await getCoinGeckoHistoricalData(ticker, 90);
                 if (data.length < 20) return [null, null, null, null, null, null, null, null, null];
                 const closes = data.map(d => d.close);
-                const volumes = data.map(() => Math.random() * 1000000); // 模擬交易量
+                const volumes = data.map(() => Math.random() * 1000000);
+                if (closes.length !== volumes.length) {
+                    addLog(`closes 和 volumes 長度不匹配 for ${ticker}`);
+                    return [null, null, null, null, null, null, null, null, null];
+                }
                 const sma = closes.slice(-50).reduce((a, b) => a + b, 0) / 50;
                 const deltas = closes.slice(1).map((c, i) => c - closes[i]);
                 const gains = deltas.map(d => d > 0 ? d : 0);
@@ -112,7 +139,7 @@
                 const ema12 = closes.reduce((prev, curr, i) => i === 0 ? curr : prev * 11/13 + curr * 2/13, closes[0]);
                 const ema26 = closes.reduce((prev, curr, i) => i === 0 ? curr : prev * 25/27 + curr * 2/27, closes[0]);
                 const macd = ema12 - ema26;
-                const signal = macd; // 簡化
+                const signal = macd;
                 const macdDiff = macd - signal;
                 const support = Math.min(...closes.slice(-20));
                 const vwma = closes.slice(-20).reduce((a, b, i) => a + b * volumes[i], 0) / volumes.slice(-20).reduce((a, b) => a + b, 1);
@@ -372,27 +399,6 @@
         }
 
         ReactDOM.render(<App />, document.getElementById("root"));
-
-        // 初始化 Chart.js
-        const initChart = () => {
-            const canvas = document.getElementById("priceChart");
-            if (canvas && window.chartData) {
-                new Chart(canvas, {
-                    type: "line",
-                    data: window.chartData,
-                    options: {
-                        scales: {
-                            y: {
-                                beginAtZero: false
-                            }
-                        }
-                    }
-                });
-            }
-        };
-        useEffect(() => {
-            initChart();
-        }, [window.chartData]);
     </script>
 </body>
 </html>
