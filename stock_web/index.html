@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>股票與加密貨幣監聽器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/moment@2.29.1/moment.min.js"></script>
+</head>
+<body class="bg-gray-100">
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        const COINGECKO_API_BASE = "https://api.coingecko.com/api/v3";
+
+        function App() {
+            const [ticker, setTicker] = useState("");
+            const [assets, setAssets] = useState(JSON.parse(localStorage.getItem("assets")) || {});
+            const [tableData, setTableData] = useState([]);
+            const [logs, setLogs] = useState([]);
+            const [isMonitoring, setIsMonitoring] = useState(false);
+            const [rsiThreshold, setRsiThreshold] = useState(30);
+            const [buyScoreThreshold, setBuyScoreThreshold] = useState(80);
+            const [chartTicker, setChartTicker] = useState("");
+            const [chartData, setChartData] = useState(null);
+            const [coins, setCoins] = useState(null);
+
+            // 初始化 CoinGecko 貨幣對
+            useEffect(() => {
+                fetch(`${COINGECKO_API_BASE}/coins/list`)
+                    .then(res => res.json())
+                    .then(data => {
+                        const coinMap = {};
+                        data.forEach(item => {
+                            coinMap[item.symbol.toUpperCase() + "-USD"] = item.id;
+                        });
+                        setCoins(coinMap);
+                    })
+                    .catch(err => addLog(`獲取貨幣對錯誤: ${err}`));
+            }, []);
+
+            // 保存資產到 localStorage
+            useEffect(() => {
+                localStorage.setItem("assets", JSON.stringify(assets));
+            }, [assets]);
+
+            // 監聽資產
+            useEffect(() => {
+                let interval;
+                if (isMonitoring && coins) {
+                    interval = setInterval(() => monitorAssets(), 30000);
+                }
+                return () => clearInterval(interval);
+            }, [isMonitoring, coins]);
+
+            const addLog = (message) => {
+                const timestamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" });
+                setLogs(prev => [...prev, `${timestamp}: ${message}`].slice(-50));
+            };
+
+            const getCoinGeckoPrice = async (ticker) => {
+                if (!coins || !coins[ticker]) return null;
+                try {
+                    const res = await fetch(`${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`);
+                    const data = await res.json();
+                    await new Promise(resolve => setTimeout(resolve, 2000)); // 遵守配額
+                    return data[coins[ticker]]?.usd || null;
+                } catch (err) {
+                    addLog(`獲取 ${ticker} 價格錯誤: ${err}`);
+                    return null;
+                }
+            };
+
+            const getCoinGeckoHistoricalData = async (ticker, days = 90) => {
+                if (!coins || !coins[ticker]) return [];
+                try {
+                    const res = await fetch(`${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=${days}&interval=daily`);
+                    const data = await res.json();
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    return data.prices.map(([ts, price]) => ({
+                        date: moment(ts).format("YYYY-MM-DD"),
+                        close: price
+                    }));
+                } catch (err) {
+                    addLog(`獲取 ${ticker} 歷史數據錯誤: ${err}`);
+                    return [];
+                }
+            };
+
+            const calculateTechnicalIndicators = async (ticker) => {
+                const data = await getCoinGeckoHistoricalData(ticker, 90);
+                if (data.length < 20) return [null, null, null, null, null, null, null, null, null];
+                const closes = data.map(d => d.close);
+                const volumes = data.map(() => Math.random() * 1000000); // 模擬交易量
+                const sma = closes.slice(-50).reduce((a, b) => a + b, 0) / 50;
+                const deltas = closes.slice(1).map((c, i) => c - closes[i]);
+                const gains = deltas.map(d => d > 0 ? d : 0);
+                const losses = deltas.map(d => d < 0 ? -d : 0);
+                const avgGain = gains.slice(-14).reduce((a, b) => a + b, 0) / 14;
+                const avgLoss = losses.slice(-14).reduce((a, b) => a + b, 0) / 14;
+                const rs = avgGain / (avgLoss || 1);
+                const rsi = 100 - (100 / (1 + rs));
+                const sma20 = closes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+                const std20 = Math.sqrt(closes.slice(-20).reduce((a, b) => a + Math.pow(b - sma20, 2), 0) / 20);
+                const upperBand = sma20 + 2 * std20;
+                const lowerBand = sma20 - 2 * std20;
+                const ema12 = closes.reduce((prev, curr, i) => i === 0 ? curr : prev * 11/13 + curr * 2/13, closes[0]);
+                const ema26 = closes.reduce((prev, curr, i) => i === 0 ? curr : prev * 25/27 + curr * 2/27, closes[0]);
+                const macd = ema12 - ema26;
+                const signal = macd; // 簡化
+                const macdDiff = macd - signal;
+                const support = Math.min(...closes.slice(-20));
+                const vwma = closes.slice(-20).reduce((a, b, i) => a + b * volumes[i], 0) / volumes.slice(-20).reduce((a, b) => a + b, 1);
+                const atr = closes.slice(-14).map((_, i) => Math.max(closes[i+1] - closes[i], Math.abs(closes[i+1] - closes[i]))).reduce((a, b) => a + b, 0) / 14;
+                return [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr];
+            };
+
+            const addAsset = async () => {
+                const t = ticker.trim().toUpperCase();
+                if (!t) {
+                    alert("請輸入股票或加密貨幣代碼");
+                    return;
+                }
+                if (assets[t]) {
+                    alert("該資產已在監聽列表中");
+                    return;
+                }
+                if (t.endsWith("-USD") && (!coins || !coins[t])) {
+                    alert(`${t} 不受 CoinGecko 支援`);
+                    return;
+                }
+                const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr] = await calculateTechnicalIndicators(t);
+                if (upperBand == null || lowerBand == null) {
+                    alert(`無法獲取 ${t} 的技術指標`);
+                    return;
+                }
+                setAssets(prev => ({ ...prev, [t]: { high: upperBand, low: lowerBand } }));
+                addLog(`添加資產 ${t} (${t.endsWith("-USD") ? "加密貨幣" : "股票"})`);
+                setTicker("");
+            };
+
+            const removeAsset = (t) => {
+                setAssets(prev => {
+                    const newAssets = { ...prev };
+                    delete newAssets[t];
+                    return newAssets;
+                });
+                setTableData(prev => prev.filter(row => row.ticker !== t));
+                addLog(`移除資產 ${t}`);
+            };
+
+            const startMonitoring = () => {
+                if (!Object.keys(assets).length) {
+                    alert("請先添加至少一項資產");
+                    return;
+                }
+                setIsMonitoring(true);
+                addLog(`開始監聽 ${Object.keys(assets).length} 項資產...`);
+            };
+
+            const stopMonitoring = () => {
+                setIsMonitoring(false);
+                addLog("監聽已停止");
+            };
+
+            const showChart = async (t) => {
+                const data = await getCoinGeckoHistoricalData(t, 90);
+                if (!data.length) {
+                    alert(`無法獲取 ${t} 的歷史數據`);
+                    return;
+                }
+                setChartData({
+                    labels: data.map(d => d.date),
+                    datasets: [{
+                        label: `${t} 價格 (USD)`,
+                        data: data.map(d => d.close),
+                        borderColor: "#4CAF50",
+                        fill: false
+                    }]
+                });
+                setChartTicker(t);
+                addLog(`顯示 ${t} 的價格走勢圖`);
+            };
+
+            const monitorAssets = async () => {
+                const newTableData = [];
+                for (const ticker of Object.keys(assets)) {
+                    try {
+                        const price = await getCoinGeckoPrice(ticker);
+                        if (!price) continue;
+                        const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr] = await calculateTechnicalIndicators(ticker);
+                        let buyScore = 0;
+                        const indicators = [];
+                        if (sma && price < sma) {
+                            buyScore += 30;
+                            indicators.push(`價格低於SMA: ${sma.toFixed(2)}`);
+                        }
+                        if (rsi && rsi < rsiThreshold) {
+                            buyScore += 30;
+                            indicators.push(`RSI超賣: ${rsi.toFixed(2)}`);
+                        }
+                        if (lowerBand && price < lowerBand) {
+                            buyScore += 20;
+                            indicators.push(`價格低於布林下軌: ${lowerBand.toFixed(2)}`);
+                        }
+                        if (macdDiff && macdDiff > 0) {
+                            buyScore += 20;
+                            indicators.push(`MACD看漲: ${macdDiff.toFixed(2)}`);
+                        }
+                        if (vwma && price < vwma) {
+                            buyScore += 20;
+                            indicators.push(`價格低於VWMA: ${vwma.toFixed(2)}`);
+                        }
+                        const sentimentScore = ticker.endsWith("-USD") ? 75 : 50;
+                        if (sentimentScore > 70) {
+                            buyScore += 20;
+                            indicators.push(`正面情緒: ${sentimentScore}`);
+                        }
+                        let buyMessage = `暫不建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
+                        if (buyScore >= buyScoreThreshold) {
+                            buyMessage = `強烈建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
+                        }
+                        const stopLoss = support || (price - 2 * (atr || price * 0.05));
+                        newTableData.push({
+                            ticker,
+                            price,
+                            sma20,
+                            rsi,
+                            upperBand,
+                            lowerBand,
+                            macdDiff,
+                            vwma,
+                            buyScore,
+                            recommendation: buyMessage
+                        });
+                        addLog(`${ticker} 當前價格: ${price.toFixed(2)}, 買入建議: ${buyMessage}, 止損價格: ${stopLoss.toFixed(2)}`);
+                    } catch (err) {
+                        addLog(`處理 ${ticker} 錯誤: ${err}`);
+                    }
+                }
+                setTableData(newTableData);
+            };
+
+            return (
+                <div className="container mx-auto p-4">
+                    <h1 className="text-2xl font-bold mb-4">股票與加密貨幣監聽器</h1>
+                    <div className="mb-4">
+                        <label className="block">股票/加密貨幣代碼 (如 BTC-USD):</label>
+                        <input
+                            type="text"
+                            value={ticker}
+                            onChange={e => setTicker(e.target.value)}
+                            className="border p-2 w-64"
+                        />
+                        <button onClick={addAsset} className="bg-blue-500 text-white p-2 ml-2">添加資產</button>
+                    </div>
+                    <div className="mb-4">
+                        <button onClick={() => setShowSettings(true)} className="bg-gray-500 text-white p-2 mr-2">設置</button>
+                        <button onClick={startMonitoring} disabled={isMonitoring} className="bg-green-500 text-white p-2 mr-2 disabled:bg-gray-300">開始監聽</button>
+                        <button onClick={stopMonitoring} disabled={!isMonitoring} className="bg-red-500 text-white p-2 disabled:bg-gray-300">停止監聽</button>
+                    </div>
+                    {showSettings && (
+                        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center">
+                            <div className="bg-white p-4 rounded">
+                                <h2 className="text-lg font-bold mb-2">設置</h2>
+                                <div className="mb-2">
+                                    <label>RSI 買入閾值 (&lt;):</label>
+                                    <input
+                                        type="number"
+                                        value={rsiThreshold}
+                                        onChange={e => setRsiThreshold(e.target.value)}
+                                        className="border p-1 ml-2"
+                                    />
+                                </div>
+                                <div className="mb-2">
+                                    <label>買入分數閾值 (≥):</label>
+                                    <input
+                                        type="number"
+                                        value={buyScoreThreshold}
+                                        onChange={e => setBuyScoreThreshold(e.target.value)}
+                                        className="border p-1 ml-2"
+                                    />
+                                </div>
+                                <button
+                                    onClick={() => setShowSettings(false)}
+                                    className="bg-blue-500 text-white p-2"
+                                >
+                                    保存
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    <div className="mb-4">
+                        <h2 className="text-lg font-bold">資產列表</h2>
+                        <ul className="border p-2 max-h-32 overflow-y-auto">
+                            {Object.keys(assets).map(t => (
+                                <li key={t} className="flex justify-between">
+                                    <span>{t} ({t.endsWith("-USD") ? "加密貨幣" : "股票"}): 高位={assets[t].high.toFixed(2)}, 低位={assets[t].low.toFixed(2)}</span>
+                                    <button onClick={() => removeAsset(t)} className="text-red-500">移除</button>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                    <div className="mb-4">
+                        <h2 className="text-lg font-bold">價格走勢</h2>
+                        <select
+                            value={chartTicker}
+                            onChange={e => showChart(e.target.value)}
+                            className="border p-2"
+                        >
+                            <option value="">選擇資產</option>
+                            {Object.keys(assets).map(t => (
+                                <option key={t} value={t}>{t}</option>
+                            ))}
+                        </select>
+                        {chartData && (
+                            <canvas id="priceChart" className="mt-4" style={{ maxHeight: "400px" }}></canvas>
+                        )}
+                    </div>
+                    <div className="mb-4">
+                        <h2 className="text-lg font-bold">數據表格</h2>
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full border">
+                                <thead>
+                                    <tr className="bg-gray-200">
+                                        <th className="border p-2">資產代碼</th>
+                                        <th className="border p-2">當前價格</th>
+                                        <th className="border p-2">SMA20</th>
+                                        <th className="border p-2">RSI</th>
+                                        <th className="border p-2">布林上軌</th>
+                                        <th className="border p-2">布林下軌</th>
+                                        <th className="border p-2">MACD</th>
+                                        <th className="border p-2">VWMA</th>
+                                        <th className="border p-2">買入分數</th>
+                                        <th className="border p-2">建議</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {tableData.map(row => (
+                                        <tr key={row.ticker}>
+                                            <td className="border p-2">{row.ticker}</td>
+                                            <td className="border p-2">{row.price?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.sma20?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.rsi?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.upperBand?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.lowerBand?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.macdDiff?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.vwma?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.buyScore?.toFixed(2) || "N/A"}</td>
+                                            <td className="border p-2">{row.recommendation}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div>
+                        <h2 className="text-lg font-bold">日誌</h2>
+                        <div className="border p-2 h-32 overflow-y-auto bg-white">
+                            {logs.map((log, i) => (
+                                <div key={i}>{log}</div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById("root"));
+
+        // 初始化 Chart.js
+        const initChart = () => {
+            const canvas = document.getElementById("priceChart");
+            if (canvas && window.chartData) {
+                new Chart(canvas, {
+                    type: "line",
+                    data: window.chartData,
+                    options: {
+                        scales: {
+                            y: {
+                                beginAtZero: false
+                            }
+                        }
+                    }
+                });
+            }
+        };
+        useEffect(() => {
+            initChart();
+        }, [window.chartData]);
+    </script>
+</body>
+</html>
