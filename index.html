@@ -36,12 +36,39 @@
                     .then(res => res.json())
                     .then(data => {
                         const coinMap = {};
+                        const symbolCounts = {};
+                        const ethEntries = [];
+
+                        // 統計 symbol 出現次數並收集 ETH 相關數據
                         data.forEach(item => {
-                            coinMap[item.symbol.toUpperCase() + "-USD"] = item.id;
+                            if (!item.symbol || !item.id) return; // 過濾無效數據
+                            const symbol = item.symbol.toUpperCase() + "-USD";
+                            coinMap[symbol] = item.id; // 暫存最後一個 id
+                            symbolCounts[symbol] = (symbolCounts[symbol] || 0) + 1;
+                            if (item.symbol.toUpperCase() === "ETH") {
+                                ethEntries.push({ id: item.id, symbol: item.symbol, name: item.name });
+                            }
                         });
+
+                        // 優先設置主流幣種
+                        const priorityCoins = {
+                            "ETH-USD": "ethereum",
+                            "BTC-USD": "bitcoin"
+                        };
+                        Object.keys(priorityCoins).forEach(symbol => {
+                            if (coinMap[symbol] && coinMap[symbol] !== priorityCoins[symbol]) {
+                                addLog(`修正 ${symbol} 映射: ${coinMap[symbol]} -> ${priorityCoins[symbol]}`);
+                                coinMap[symbol] = priorityCoins[symbol];
+                            }
+                        });
+
                         setCoins(coinMap);
+                        addLog(`成功初始化 ${Object.keys(coinMap).length} 個貨幣對`);
+                        addLog(`ETH-USD 映射: ${coinMap["ETH-USD"] || "未找到"}`);
+                        addLog(`ETH symbol 出現次數: ${symbolCounts["ETH-USD"] || 0}`);
+                        addLog(`ETH 相關幣種: ${JSON.stringify(ethEntries)}`);
                     })
-                    .catch(err => addLog(`獲取貨幣對錯誤: ${err}`));
+                    .catch(err => addLog(`獲取貨幣對錯誤: ${err.message}`));
             }, []);
 
             useEffect(() => {
@@ -51,7 +78,7 @@
             useEffect(() => {
                 let interval;
                 if (isMonitoring && coins) {
-                    interval = setInterval(() => monitorAssets(), 60000); // 改為 60 秒
+                    interval = setInterval(() => monitorAssets(), 120000); // 120 秒
                 }
                 return () => clearInterval(interval);
             }, [isMonitoring, coins]);
@@ -75,32 +102,55 @@
 
             const addLog = (message) => {
                 const timestamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" });
+                console.log(`${timestamp}: ${message}`); // 控制台輸出
                 setLogs(prev => [...prev, `${timestamp}: ${message}`].slice(-50));
             };
 
             const getCoinGeckoPrice = async (ticker) => {
-                if (!coins || !coins[ticker]) return null;
+                if (!coins || !coins[ticker]) {
+                    addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
+                    return null;
+                }
                 try {
-                    const res = await fetch(`${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`);
+                    const url = `${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`;
+                    addLog(`發送 API 請求: ${url}`);
+                    const res = await fetch(url);
                     if (res.status === 429) {
-                        addLog(`CoinGecko API 配額超限，請稍後重試`);
+                        addLog(`CoinGecko API 配額超限 (429)，請稍後重試`);
+                        return null;
+                    }
+                    if (!res.ok) {
+                        addLog(`API 請求失敗，狀態碼: ${res.status}`);
                         return null;
                     }
                     const data = await res.json();
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                    return data[coins[ticker]] && data[coins[ticker]].usd ? data[coins[ticker]].usd : null;
+                    addLog(`API 回應 for ${ticker}: ${JSON.stringify(data)}`);
+                    const price = data[coins[ticker]] && data[coins[ticker]].usd ? data[coins[ticker]].usd : null;
+                    if (!price) {
+                        addLog(`未從回應中獲取 ${ticker} 的價格，可能無效或為 0`);
+                    }
+                    return price;
                 } catch (err) {
-                    addLog(`獲取 ${ticker} 價格錯誤: ${err}`);
+                    addLog(`獲取 ${ticker} 價格錯誤: ${err.message}`);
                     return null;
                 }
             };
 
             const getCoinGeckoHistoricalData = async (ticker, days = 90) => {
-                if (!coins || !coins[ticker]) return [];
+                if (!coins || !coins[ticker]) {
+                    addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
+                    return [];
+                }
                 try {
-                    const res = await fetch(`${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=${days}&interval=daily`);
+                    const url = `${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=${days}&interval=daily`;
+                    addLog(`發送歷史數據請求: ${url}`);
+                    const res = await fetch(url);
                     if (res.status === 429) {
-                        addLog(`CoinGecko API 配額超限，請稍後重試`);
+                        addLog(`CoinGecko API 配額超限 (429)，請稍後重試`);
+                        return [];
+                    }
+                    if (!res.ok) {
+                        addLog(`歷史數據請求失敗，狀態碼: ${res.status}`);
                         return [];
                     }
                     const data = await res.json();
@@ -110,14 +160,17 @@
                         close: price
                     }));
                 } catch (err) {
-                    addLog(`獲取 ${ticker} 歷史數據錯誤: ${err}`);
+                    addLog(`獲取 ${ticker} 歷史數據錯誤: ${err.message}`);
                     return [];
                 }
             };
 
             const calculateTechnicalIndicators = async (ticker) => {
                 const data = await getCoinGeckoHistoricalData(ticker, 90);
-                if (data.length < 20) return [null, null, null, null, null, null, null, null, null];
+                if (data.length < 20) {
+                    addLog(`歷史數據不足 for ${ticker}，僅有 ${data.length} 條記錄`);
+                    return [null, null, null, null, null, null, null, null, null];
+                }
                 const closes = data.map(d => d.close);
                 const volumes = data.map(() => Math.random() * 1000000);
                 if (closes.length !== volumes.length) {
@@ -188,6 +241,7 @@
                 }
                 setIsMonitoring(true);
                 addLog(`開始監聽 ${Object.keys(assets).length} 項資產...`);
+                monitorAssets(); // 立即執行
             };
 
             const stopMonitoring = () => {
@@ -216,59 +270,98 @@
 
             const monitorAssets = async () => {
                 const newTableData = [];
-                for (const ticker of Object.keys(assets)) {
-                    try {
-                        const price = await getCoinGeckoPrice(ticker);
-                        if (!price) continue;
-                        const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr] = await calculateTechnicalIndicators(ticker);
-                        let buyScore = 0;
-                        const indicators = [];
-                        if (sma && price < sma) {
-                            buyScore += 30;
-                            indicators.push(`價格低於SMA: ${sma.toFixed(2)}`);
-                        }
-                        if (rsi && rsi < rsiThreshold) {
-                            buyScore += 30;
-                            indicators.push(`RSI超賣: ${rsi.toFixed(2)}`);
-                        }
-                        if (lowerBand && price < lowerBand) {
-                            buyScore += 20;
-                            indicators.push(`價格低於布林下軌: ${lowerBand.toFixed(2)}`);
-                        }
-                        if (macdDiff && macdDiff > 0) {
-                            buyScore += 20;
-                            indicators.push(`MACD看漲: ${macdDiff.toFixed(2)}`);
-                        }
-                        if (vwma && price < vwma) {
-                            buyScore += 20;
-                            indicators.push(`價格低於VWMA: ${vwma.toFixed(2)}`);
-                        }
-                        const sentimentScore = ticker.endsWith("-USD") ? 75 : 50;
-                        if (sentimentScore > 70) {
-                            buyScore += 20;
-                            indicators.push(`正面情緒: ${sentimentScore}`);
-                        }
-                        let buyMessage = `暫不建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
-                        if (buyScore >= buyScoreThreshold) {
-                            buyMessage = `強烈建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
-                        }
-                        const stopLoss = support || (price - 2 * (atr || price * 0.05));
-                        newTableData.push({
-                            ticker,
-                            price,
-                            sma20,
-                            rsi,
-                            upperBand,
-                            lowerBand,
-                            macdDiff,
-                            vwma,
-                            buyScore,
-                            recommendation: buyMessage
-                        });
-                        addLog(`${ticker} 當前價格: ${price.toFixed(2)}, 買入建議: ${buyMessage}, 止損價格: ${stopLoss.toFixed(2)}`);
-                    } catch (err) {
-                        addLog(`處理 ${ticker} 錯誤: ${err}`);
+                const tickers = Object.keys(assets);
+                if (!tickers.length) {
+                    addLog("無資產可監聽");
+                    return;
+                }
+
+                try {
+                    const ids = tickers.slice(0, 10).map(t => coins[t]).filter(Boolean).join(",");
+                    if (!ids) {
+                        addLog("無有效 ticker 可查詢");
+                        return;
                     }
+                    const url = `${COINGECKO_API_BASE}/simple/price?ids=${ids}&vs_currencies=usd`;
+                    addLog(`批量查詢 API 請求: ${url}`);
+                    const res = await fetch(url);
+                    if (res.status === 429) {
+                        addLog(`CoinGecko API 配額超限 (429)`);
+                        return;
+                    }
+                    if (!res.ok) {
+                        addLog(`API 請求失敗，狀態碼: ${res.status}`);
+                        return;
+                    }
+                    const priceData = await res.json();
+                    addLog(`批量查詢回應: ${JSON.stringify(priceData)}`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+
+                    for (const ticker of tickers) {
+                        try {
+                            const coinId = coins[ticker];
+                            if (!coinId) {
+                                addLog(`跳過 ${ticker}：無對應 CoinGecko ID`);
+                                continue;
+                            }
+                            const price = priceData[coinId]?.usd ?? null;
+                            if (price === null || price < 0.01) {
+                                addLog(`未獲取 ${ticker} 的有效價格: ${price}（過低或無效）`);
+                                continue;
+                            }
+
+                            const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr] = await calculateTechnicalIndicators(ticker);
+                            let buyScore = 0;
+                            const indicators = [];
+                            if (sma && price < sma) {
+                                buyScore += 30;
+                                indicators.push(`價格低於SMA: ${sma.toFixed(2)}`);
+                            }
+                            if (rsi && rsi < rsiThreshold) {
+                                buyScore += 30;
+                                indicators.push(`RSI超賣: ${rsi.toFixed(2)}`);
+                            }
+                            if (lowerBand && price < lowerBand) {
+                                buyScore += 20;
+                                indicators.push(`價格低於布林下軌: ${lowerBand.toFixed(2)}`);
+                            }
+                            if (macdDiff && macdDiff > 0) {
+                                buyScore += 20;
+                                indicators.push(`MACD看漲: ${macdDiff.toFixed(2)}`);
+                            }
+                            if (vwma && price < vwma) {
+                                buyScore += 20;
+                                indicators.push(`價格低於VWMA: ${vwma.toFixed(2)}`);
+                            }
+                            const sentimentScore = ticker.endsWith("-USD") ? 75 : 50;
+                            if (sentimentScore > 70) {
+                                buyScore += 20;
+                                indicators.push(`正面情緒: ${sentimentScore}`);
+                            }
+                            let buyMessage = `暫不建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
+                            if (buyScore >= buyScoreThreshold) {
+                                buyMessage = `強烈建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
+                            }
+                            const stopLoss = support || (price - 2 * (atr || price * 0.05));
+                            newTableData.push({
+                                ticker,
+                                price,
+                                sma20,
+                                rsi,
+                                upperBand,
+                                lowerBand,
+                                macdDiff,
+                                vwma,
+                                buyScore,
+                                recommendation: buyMessage
+                            });
+                            addLog(`${ticker} 當前價格: ${price.toFixed(2)}, 買入建議: ${buyMessage}, 止損價格: ${stopLoss.toFixed(2)}`);
+                        } catch (err) {
+                            addLog(`處理 ${ticker} 錯誤: ${err.message}`);
+                        }
+                    }
+                } catch (err) {
+                    addLog(`批量查詢價格錯誤: ${err.message}`);
                 }
                 setTableData(newTableData);
             };
@@ -398,7 +491,9 @@
             );
         }
 
-        ReactDOM.render(<App />, document.getElementById("root"));
+        const { createRoot } = ReactDOM;
+        const root = createRoot(document.getElementById("root"));
+        root.render(<App />);
     </script>
 </body>
 </html>
