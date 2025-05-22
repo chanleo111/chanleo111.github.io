@@ -19,10 +19,11 @@
 
         const COINGECKO_API_BASE = "https://api.coingecko.com/api/v3";
         const COINAPI_API_KEY = "cbc368b2-d678-4635-a623-4cda8462da3b"; // Replace with your valid CoinAPI key
-        const NOMICS_API_KEY = "YOUR_NOMICS_KEY"; // Replace with your Nomics API key
         let coinAPIRequests = 0;
         const MAX_COINAPI_REQUESTS = 100;
+        const COINAPI_REQUEST_THRESHOLD = 95; // Switch to CoinGecko if requests ≥ 95
         const ohlcCache = {};
+        const priceCache = {}; // Cache for recent prices
 
         function CryptoMonitor() {
             const [ticker, setTicker] = useState("");
@@ -38,6 +39,7 @@
             const [showSettings, setShowSettings] = useState(false);
             const [apiError, setApiError] = useState("");
             const [isLoadingChart, setIsLoadingChart] = useState(false);
+            const [apiStatus, setApiStatus] = useState(""); // Track API usage status
 
             useEffect(() => {
                 const fetchCoins = async (retries = 3) => {
@@ -207,6 +209,7 @@
                 }
                 if (COINAPI_API_KEY === "YOUR_COINAPI_KEY") {
                     addLog("CoinAPI 密鑰未配置，請在代碼中設置 COINAPI_API_KEY");
+                    setApiStatus("CoinAPI 密鑰未配置，使用 CoinGecko");
                     return null;
                 }
                 try {
@@ -216,7 +219,8 @@
                     const res = await fetch(url);
                     if (res.status === 429) {
                         addLog(`CoinAPI 配額超限 (429)`);
-                        setApiError("CoinAPI 配額超限，請稍後重試");
+                        setApiError("CoinAPI 配額超限，切換到 CoinGecko");
+                        setApiStatus("CoinAPI 配額超限，使用 CoinGecko");
                         return null;
                     }
                     if (!res.ok) {
@@ -228,6 +232,9 @@
                     const price = data.rate || null;
                     addLog(`獲取 ${ticker} 價格: ${price}`);
                     coinAPIRequests++;
+                    if (coinAPIRequests >= COINAPI_REQUEST_THRESHOLD) {
+                        setApiStatus("接近 CoinAPI 配額上限，切換到 CoinGecko");
+                    }
                     return price;
                 } catch (err) {
                     addLog(`獲取 ${ticker} CoinAPI 價格錯誤: ${err.message}`);
@@ -236,45 +243,16 @@
                 }
             };
 
-            const getNomicsPrice = async (ticker) => {
-                if (!ticker.endsWith("-USD")) {
-                    addLog(`Nomics 不支持非 USD 貨幣對: ${ticker}`);
-                    return null;
-                }
-                if (NOMICS_API_KEY === "YOUR_NOMICS_KEY") {
-                    addLog("Nomics 密鑰未配置，請在代碼中設置 NOMICS_API_KEY");
-                    return null;
-                }
-                try {
-                    const [base] = ticker.split("-USD");
-                    const url = `https://api.nomics.com/v1/currencies/ticker?key=${NOMICS_API_KEY}&ids=${base}&interval=1h&convert=USD`;
-                    addLog(`發送 Nomics 價格請求: ${url}`);
-                    const res = await fetch(url);
-                    if (res.status === 429) {
-                        addLog(`Nomics 配額超限 (429)`);
-                        setApiError("Nomics 配額超限，請稍後重試");
-                        return null;
-                    }
-                    if (!res.ok) {
-                        addLog(`Nomics 請求失敗，狀態碼: ${res.status}`);
-                        setApiError(`Nomics 請求失敗 (狀態碼: ${res.status})`);
-                        return null;
-                    }
-                    const data = await res.json();
-                    const price = data[0]?.price ? parseFloat(data[0].price) : null;
-                    addLog(`獲取 ${ticker} 價格: ${price}`);
-                    return price;
-                } catch (err) {
-                    addLog(`獲取 ${ticker} Nomics 價格錯誤: ${err.message}`);
-                    setApiError(`Nomics 錯誤: ${err.message}`);
-                    return null;
-                }
-            };
-
             const getCoinGeckoPrice = async (ticker) => {
                 if (!coins || !coins[ticker]) {
                     addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
                     return null;
+                }
+                // Check cache first
+                const cacheKey = ticker;
+                if (priceCache[cacheKey] && Date.now() - priceCache[cacheKey].timestamp < 5 * 60 * 1000) {
+                    addLog(`使用緩存的 ${ticker} 價格: ${priceCache[cacheKey].price}`);
+                    return priceCache[cacheKey].price;
                 }
                 try {
                     const url = `${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`;
@@ -292,7 +270,10 @@
                     }
                     const data = await res.json();
                     const price = data[coins[ticker]]?.usd || null;
-                    addLog(`獲取 ${ticker} 價格: ${price}`);
+                    if (price) {
+                        priceCache[cacheKey] = { price, timestamp: Date.now() };
+                        addLog(`獲取 ${ticker} 價格: ${price}`);
+                    }
                     return price;
                 } catch (err) {
                     addLog(`獲取 ${ticker} CoinGecko 價格錯誤: ${err.message}`);
@@ -302,13 +283,44 @@
             };
 
             const getPriceWithFallback = async (ticker) => {
-                if (coinAPIRequests < MAX_COINAPI_REQUESTS) {
+                if (coinAPIRequests < COINAPI_REQUEST_THRESHOLD) {
                     const price = await getCoinAPIPrice(ticker);
                     if (price) return price;
                 }
-                const nomicsPrice = await getNomicsPrice(ticker);
-                if (nomicsPrice) return nomicsPrice;
                 return await getCoinGeckoPrice(ticker);
+            };
+
+            const getCoinGeckoHistoricalData = async (ticker) => {
+                if (!coins || !coins[ticker]) {
+                    addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
+                    return [];
+                }
+                try {
+                    const url = `${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=1&interval=hourly`;
+                    addLog(`發送 CoinGecko 歷史數據請求: ${url}`);
+                    const res = await fetch(url);
+                    if (res.status === 429) {
+                        addLog(`CoinGecko API 配額超限 (429)`);
+                        setApiError("CoinGecko 配額超限，請稍後重試");
+                        return [];
+                    }
+                    if (!res.ok) {
+                        addLog(`CoinGecko 歷史數據請求失敗，狀態碼: ${res.status}`);
+                        setApiError(`CoinGecko 歷史數據請求失敗 (狀態碼: ${res.status})`);
+                        return [];
+                    }
+                    const data = await res.json();
+                    const prices = data.prices.map(([timestamp, price]) => ({
+                        timestamp,
+                        price
+                    })).filter(p => p.price);
+                    addLog(`獲取 ${ticker} 24小時歷史數據: ${prices.length} 條記錄`);
+                    return prices;
+                } catch (err) {
+                    addLog(`獲取 ${ticker} CoinGecko 歷史數據錯誤: ${err.message}`);
+                    setApiError(`CoinGecko 歷史數據錯誤: ${err.message}`);
+                    return [];
+                }
             };
 
             const getCoinGeckoOHLCData = async (ticker, days = 30) => {
@@ -510,39 +522,38 @@
                 setIsLoadingChart(true);
                 addLog(`顯示 ${t} 的24小時折線圖`);
 
+                let prices = [];
                 const asset = assets[t];
-                if (!asset || !asset.prices || asset.prices.length === 0) {
-                    const price = await getPriceWithFallback(t);
-                    if (price === null || price < 0.01) {
-                        addLog(`無法獲取 ${t} 的當前價格: ${price}`);
+                if (asset && asset.prices && asset.prices.length >= 2) {
+                    prices = [...asset.prices].sort((a, b) => a.timestamp - b.timestamp);
+                    addLog(`使用實時價格數據顯示 ${t} 圖表: ${prices.length} 個數據點`);
+                } else {
+                    // Fetch historical data from CoinGecko
+                    addLog(`實時數據不足 (${asset?.prices?.length || 0} 個數據點)，獲取 ${t} 歷史數據`);
+                    const historicalPrices = await getCoinGeckoHistoricalData(t);
+                    if (historicalPrices.length < 2) {
+                        addLog(`無法獲取 ${t} 的歷史數據: ${historicalPrices.length} 個數據點`);
                         setApiError(`沒有足夠的數據顯示 ${t} 的24小時價格走勢`);
                         alert(`沒有足夠的數據顯示 ${t} 的24小時價格走勢`);
                         setIsLoadingChart(false);
                         return;
                     }
-                    const now = Date.now();
+                    prices = historicalPrices;
+                    // Update assets with historical data to prevent repeated fetches
                     setAssets(prev => ({
                         ...prev,
                         [t]: {
                             ...prev[t],
-                            prices: [{ price, timestamp: now }],
+                            prices: prices.map(p => ({ price: p.price, timestamp: p.timestamp })),
                             type: 'crypto'
                         }
                     }));
                 }
-                const updatedAsset = assets[t] || { prices: [] };
-                if (updatedAsset.prices.length < 2) {
-                    addLog(`數據點不足 (${updatedAsset.prices.length})，需要至少2個點顯示 ${t} 的24小時價格走勢`);
-                    setApiError(`數據點不足，請等待更多價格數據（當前有 ${updatedAsset.prices.length} 個點）`);
-                    alert(`數據點不足，請等待更多價格數據（當前有 ${updatedAsset.prices.length} 個點）`);
-                    setIsLoadingChart(false);
-                    return;
-                }
-                const sortedPrices = [...updatedAsset.prices].sort((a, b) => a.timestamp - b.timestamp);
+
                 setChartData({
                     datasets: [{
                         label: `${t} 24小時價格走勢 (USD)`,
-                        data: sortedPrices.map(p => ({
+                        data: prices.map(p => ({
                             x: new Date(p.timestamp),
                             y: p.price
                         })),
@@ -620,6 +631,9 @@
                         <h2 className="text-lg font-bold">價格走勢</h2>
                         {apiError && (
                             <div className="text-red-500 mb-2">{apiError}</div>
+                        )}
+                        {apiStatus && (
+                            <div className="text-yellow-500 mb-2">{apiStatus}</div>
                         )}
                         <div className="flex items-center mb-2">
                             <select
