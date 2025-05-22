@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>加密貨幣監聽器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/moment@2.29.1/moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1.0.0/dist/chartjs-adapter-moment.min.js"></script>
+</head>
+<body class="bg-gray-100">
+    <div id="root"></div>
+    <script type="text/babel" data-presets="react">
+        const { useState, useEffect } = React;
+
+        const COINGECKO_API_BASE = "https://api.coingecko.com/api/v3";
+        const COINAPI_API_KEY = "cbc368b2-d678-4635-a623-4cda8462da3b"; // Replace with your valid CoinAPI key
+        const NOMICS_API_KEY = "YOUR_NOMICS_KEY"; // Replace with your Nomics API key
+        let coinAPIRequests = 0;
+        const MAX_COINAPI_REQUESTS = 100;
+        const ohlcCache = {};
+
+        function CryptoMonitor() {
+            const [ticker, setTicker] = useState("");
+            const [assets, setAssets] = useState(JSON.parse(localStorage.getItem("cryptoAssets")) || {});
+            const [tableData, setTableData] = useState([]);
+            const [logs, setLogs] = useState([]);
+            const [isMonitoring, setIsMonitoring] = useState(false);
+            const [rsiThreshold, setRsiThreshold] = useState(30);
+            const [buyScoreThreshold, setBuyScoreThreshold] = useState(80);
+            const [chartTicker, setChartTicker] = useState("");
+            const [chartData, setChartData] = useState(null);
+            const [coins, setCoins] = useState(null);
+            const [showSettings, setShowSettings] = useState(false);
+            const [apiError, setApiError] = useState("");
+            const [isLoadingChart, setIsLoadingChart] = useState(false);
+
+            useEffect(() => {
+                const fetchCoins = async (retries = 3) => {
+                    for (let i = 0; i < retries; i++) {
+                        try {
+                            const res = await fetch(`${COINGECKO_API_BASE}/coins/list`);
+                            if (!res.ok) {
+                                throw new Error(`狀態碼: ${res.status}`);
+                            }
+                            const data = await res.json();
+                            const coinMap = {};
+                            const symbolCounts = {};
+                            const ethEntries = [];
+                            data.forEach(item => {
+                                if (!item.symbol || !item.id) return;
+                                const symbol = item.symbol.toUpperCase() + "-USD";
+                                coinMap[symbol] = item.id;
+                                symbolCounts[symbol] = (symbolCounts[symbol] || 0) + 1;
+                                if (item.symbol.toUpperCase() === "ETH") {
+                                    ethEntries.push({ id: item.id, symbol: item.symbol, name: item.name });
+                                }
+                            });
+                            const priorityCoins = {
+                                "ETH-USD": "ethereum",
+                                "BTC-USD": "bitcoin"
+                            };
+                            Object.keys(priorityCoins).forEach(symbol => {
+                                if (coinMap[symbol] && coinMap[symbol] !== priorityCoins[symbol]) {
+                                    addLog(`修正 ${symbol} 映射: ${coinMap[symbol]} -> ${priorityCoins[symbol]}`);
+                                    coinMap[symbol] = priorityCoins[symbol];
+                                }
+                            });
+                            setCoins(coinMap);
+                            addLog(`成功初始化 ${Object.keys(coinMap).length} 個加密貨幣對`);
+                            addLog(`ETH-USD 映射: ${coinMap["ETH-USD"] || "未找到"}`);
+                            return;
+                        } catch (err) {
+                            addLog(`獲取加密貨幣對錯誤 (嘗試 ${i + 1}/${retries}): ${err.message}`);
+                            if (i === retries - 1) {
+                                setApiError("無法加載加密貨幣列表，請稍後重試");
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                        }
+                    }
+                };
+                fetchCoins();
+            }, []);
+
+            useEffect(() => {
+                localStorage.setItem("cryptoAssets", JSON.stringify(assets));
+            }, [assets]);
+
+            useEffect(() => {
+                let interval;
+                if (isMonitoring && coins) {
+                    interval = setInterval(() => monitorCryptos(), 60000);
+                    monitorCryptos();
+                }
+                return () => clearInterval(interval);
+            }, [isMonitoring, coins]);
+
+            useEffect(() => {
+                const canvas = document.getElementById("priceChart");
+                if (canvas && chartData) {
+                    const ctx = canvas.getContext("2d");
+                    if (canvas.chart) {
+                        canvas.chart.destroy();
+                    }
+                    canvas.chart = new Chart(ctx, {
+                        type: "line",
+                        data: chartData,
+                        options: {
+                            plugins: {
+                                legend: { display: true }
+                            },
+                            scales: {
+                                x: {
+                                    type: "time",
+                                    time: {
+                                        unit: "hour",
+                                        displayFormats: {
+                                            hour: "HH:mm",
+                                            day: "YYYY-MM-DD"
+                                        }
+                                    }
+                                },
+                                y: {
+                                    beginAtZero: false,
+                                    title: { display: true, text: "價格 (USD)" }
+                                }
+                            },
+                            interaction: {
+                                intersect: false,
+                                mode: "index"
+                            }
+                        }
+                    });
+                }
+                return () => {
+                    if (canvas && canvas.chart) {
+                        canvas.chart.destroy();
+                    }
+                };
+            }, [chartData]);
+
+            const addLog = (message) => {
+                const timestamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" });
+                console.log(`${timestamp}: ${message}`);
+                setLogs(prev => [...prev, `${timestamp}: ${message}`].slice(-50));
+            };
+
+            const addCrypto = () => {
+                if (!ticker) {
+                    addLog("請輸入有效的加密貨幣代碼");
+                    setApiError("請輸入加密貨幣代碼");
+                    return;
+                }
+                let formattedTicker = ticker.toUpperCase();
+                if (!formattedTicker.endsWith("-USD")) {
+                    formattedTicker = formattedTicker + "-USD";
+                }
+                if (!coins || !coins[formattedTicker]) {
+                    addLog(`無效的加密貨幣代碼: ${formattedTicker}，未在 CoinGecko 貨幣對中找到`);
+                    setApiError(`不支持的加密貨幣: ${formattedTicker}`);
+                    return;
+                }
+                setAssets(prev => ({
+                    ...prev,
+                    [formattedTicker]: {
+                        prices: [],
+                        type: "crypto"
+                    }
+                }));
+                addLog(`添加加密貨幣 ${formattedTicker}`);
+                setTicker("");
+                setApiError("");
+            };
+
+            const removeCrypto = (ticker) => {
+                setAssets(prev => {
+                    const newAssets = { ...prev };
+                    delete newAssets[ticker];
+                    return newAssets;
+                });
+                addLog(`移除加密貨幣 ${ticker}`);
+            };
+
+            const startMonitoring = () => {
+                if (!Object.keys(assets).length) {
+                    addLog("無加密貨幣可監聽");
+                    setApiError("請先添加加密貨幣");
+                    return;
+                }
+                setIsMonitoring(true);
+                addLog(`開始監聽 ${Object.keys(assets).length} 種加密貨幣...`);
+            };
+
+            const stopMonitoring = () => {
+                setIsMonitoring(false);
+                addLog("停止監聽");
+            };
+
+            const getCoinAPIPrice = async (ticker) => {
+                if (!ticker.endsWith("-USD")) {
+                    addLog(`CoinAPI 不支持非 USD 貨幣對: ${ticker}`);
+                    return null;
+                }
+                if (COINAPI_API_KEY === "YOUR_COINAPI_KEY") {
+                    addLog("CoinAPI 密鑰未配置，請在代碼中設置 COINAPI_API_KEY");
+                    return null;
+                }
+                try {
+                    const [base] = ticker.split("-USD");
+                    const url = `https://rest.coinapi.io/v1/exchangerate/${base}/USD?apikey=${COINAPI_API_KEY}`;
+                    addLog(`發送 CoinAPI 價格請求: ${url}`);
+                    const res = await fetch(url);
+                    if (res.status === 429) {
+                        addLog(`CoinAPI 配額超限 (429)`);
+                        setApiError("CoinAPI 配額超限，請稍後重試");
+                        return null;
+                    }
+                    if (!res.ok) {
+                        addLog(`CoinAPI 請求失敗，狀態碼: ${res.status}`);
+                        setApiError(`CoinAPI 請求失敗 (狀態碼: ${res.status})`);
+                        return null;
+                    }
+                    const data = await res.json();
+                    const price = data.rate || null;
+                    addLog(`獲取 ${ticker} 價格: ${price}`);
+                    coinAPIRequests++;
+                    return price;
+                } catch (err) {
+                    addLog(`獲取 ${ticker} CoinAPI 價格錯誤: ${err.message}`);
+                    setApiError(`CoinAPI 錯誤: ${err.message}`);
+                    return null;
+                }
+            };
+
+            const getNomicsPrice = async (ticker) => {
+                if (!ticker.endsWith("-USD")) {
+                    addLog(`Nomics 不支持非 USD 貨幣對: ${ticker}`);
+                    return null;
+                }
+                if (NOMICS_API_KEY === "YOUR_NOMICS_KEY") {
+                    addLog("Nomics 密鑰未配置，請在代碼中設置 NOMICS_API_KEY");
+                    return null;
+                }
+                try {
+                    const [base] = ticker.split("-USD");
+                    const url = `https://api.nomics.com/v1/currencies/ticker?key=${NOMICS_API_KEY}&ids=${base}&interval=1h&convert=USD`;
+                    addLog(`發送 Nomics 價格請求: ${url}`);
+                    const res = await fetch(url);
+                    if (res.status === 429) {
+                        addLog(`Nomics 配額超限 (429)`);
+                        setApiError("Nomics 配額超限，請稍後重試");
+                        return null;
+                    }
+                    if (!res.ok) {
+                        addLog(`Nomics 請求失敗，狀態碼: ${res.status}`);
+                        setApiError(`Nomics 請求失敗 (狀態碼: ${res.status})`);
+                        return null;
+                    }
+                    const data = await res.json();
+                    const price = data[0]?.price ? parseFloat(data[0].price) : null;
+                    addLog(`獲取 ${ticker} 價格: ${price}`);
+                    return price;
+                } catch (err) {
+                    addLog(`獲取 ${ticker} Nomics 價格錯誤: ${err.message}`);
+                    setApiError(`Nomics 錯誤: ${err.message}`);
+                    return null;
+                }
+            };
+
+            const getCoinGeckoPrice = async (ticker) => {
+                if (!coins || !coins[ticker]) {
+                    addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
+                    return null;
+                }
+                try {
+                    const url = `${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`;
+                    addLog(`發送 CoinGecko 價格請求: ${url}`);
+                    const res = await fetch(url);
+                    if (res.status === 429) {
+                        addLog(`CoinGecko API 配額超限 (429)`);
+                        setApiError("CoinGecko 配額超限，請稍後重試");
+                        return null;
+                    }
+                    if (!res.ok) {
+                        addLog(`CoinGecko 請求失敗，狀態碼: ${res.status}`);
+                        setApiError(`CoinGecko 請求失敗 (狀態碼: ${res.status})`);
+                        return null;
+                    }
+                    const data = await res.json();
+                    const price = data[coins[ticker]]?.usd || null;
+                    addLog(`獲取 ${ticker} 價格: ${price}`);
+                    return price;
+                } catch (err) {
+                    addLog(`獲取 ${ticker} CoinGecko 價格錯誤: ${err.message}`);
+                    setApiError(`CoinGecko 錯誤: ${err.message}`);
+                    return null;
+                }
+            };
+
+            const getPriceWithFallback = async (ticker) => {
+                if (coinAPIRequests < MAX_COINAPI_REQUESTS) {
+                    const price = await getCoinAPIPrice(ticker);
+                    if (price) return price;
+                }
+                const nomicsPrice = await getNomicsPrice(ticker);
+                if (nomicsPrice) return nomicsPrice;
+                return await getCoinGeckoPrice(ticker);
+            };
+
+            const getCoinGeckoOHLCData = async (ticker, days = 30) => {
+                if (!coins || !coins[ticker]) {
+                    addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
+                    return [];
+                }
+                const cacheKey = `${ticker}_${days}d`;
+                if (ohlcCache[cacheKey] && Date.now() - ohlcCache[cacheKey].timestamp < 3600000) {
+                    addLog(`使用緩存的 ${ticker} CoinGecko OHLC 數據: ${ohlcCache[cacheKey].data.length} 條記錄`);
+                    return ohlcCache[cacheKey].data;
+                }
+                try {
+                    const url = `${COINGECKO_API_BASE}/coins/${coins[ticker]}/ohlc?vs_currency=usd&days=${days}`;
+                    addLog(`發送 CoinGecko OHLC 請求: ${url}`);
+                    const res = await fetch(url);
+                    if (res.status === 429) {
+                        addLog(`CoinGecko API 配額超限 (429)`);
+                        setApiError("CoinGecko 配額超限，請稍後重試");
+                        return [];
+                    }
+                    if (!res.ok) {
+                        addLog(`CoinGecko OHLC 請求失敗，狀態碼: ${res.status}`);
+                        setApiError(`CoinGecko OHLC 請求失敗 (狀態碼: ${res.status})`);
+                        return [];
+                    }
+                    const data = await res.json();
+                    const ohlcData = data.map(([ts, open, high, low, close]) => ({
+                        t: ts,
+                        o: open,
+                        h: high,
+                        l: low,
+                        c: close
+                    })).filter(d => d.o && d.h && d.l && d.c);
+                    addLog(`獲取 ${ticker} CoinGecko OHLC 數據: ${ohlcData.length} 條記錄`);
+                    if (ohlcData.length > 0) {
+                        ohlcCache[cacheKey] = { data: ohlcData, timestamp: Date.now() };
+                    }
+                    return ohlcData;
+                } catch (err) {
+                    addLog(`獲取 ${ticker} CoinGecko OHLC 錯誤: ${err.message}`);
+                    setApiError(`CoinGecko OHLC 錯誤: ${err.message}`);
+                    return [];
+                }
+            };
+
+            const calculateTechnicalIndicators = async (ticker) => {
+                try {
+                    const ohlcData = await getCoinGeckoOHLCData(ticker, 30);
+                    if (!ohlcData.length) {
+                        addLog(`無法計算 ${ticker} 技術指標，無 OHLC 數據`);
+                        return [null, null, null, null, null, null, null, null, null];
+                    }
+                    const closes = ohlcData.map(d => d.c);
+                    const volumes = ohlcData.map(d => d.volume || 1);
+                    const highs = ohlcData.map(d => d.h);
+                    const lows = ohlcData.map(d => d.l);
+
+                    const sma20 = closes.length >= 20
+                        ? closes.slice(-20).reduce((a, b) => a + b, 0) / 20
+                        : null;
+
+                    let gains = 0, losses = 0;
+                    for (let i = 1; i < Math.min(15, closes.length); i++) {
+                        const diff = closes[i] - closes[i - 1];
+                        if (diff > 0) gains += diff;
+                        else losses -= diff;
+                    }
+                    const avgGain = gains / 14;
+                    const avgLoss = losses / 14;
+                    const rs = avgGain / (avgLoss || 1);
+                    const rsi = avgLoss === 0 ? 100 : 100 - (100 / (1 + rs));
+
+                    const period = Math.min(20, closes.length);
+                    const sma = closes.slice(-period).reduce((a, b) => a + b, 0) / period;
+                    const stdDev = Math.sqrt(
+                        closes.slice(-period).reduce((a, b) => a + Math.pow(b - sma, 2), 0) / period
+                    );
+                    const upperBand = sma + 2 * stdDev;
+                    const lowerBand = sma - 2 * stdDev;
+
+                    const ema12 = closes.slice(-26).reduce((a, b, i) => a + b * (2 / (12 + 1)) * Math.pow(1 - 2 / (12 + 1), closes.length - i - 1), 0);
+                    const ema26 = closes.slice(-26).reduce((a, b, i) => a + b * (2 / (26 + 1)) * Math.pow(1 - 2 / (26 + 1), closes.length - i - 1), 0);
+                    const macd = ema12 - ema26;
+                    const signal = closes.slice(-9).reduce((a, b, i) => a + b * (2 / (9 + 1)) * Math.pow(1 - 2 / (9 + 1), closes.length - i - 1), 0);
+                    const macdDiff = macd - signal;
+
+                    const support = Math.min(...lows.slice(-20));
+
+                    const vwma = closes.length >= 20
+                        ? closes.slice(-20).reduce((a, b, i) => a + b * volumes[volumes.length - 20 + i], 0) /
+                          volumes.slice(-20).reduce((a, b) => a + b, 0)
+                        : null;
+
+                    const tr = highs.slice(-14).map((h, i) => Math.max(
+                        h - lows[lows.length - 14 + i],
+                        Math.abs(h - closes[closes.length - 15 + i] || h),
+                        Math.abs(lows[lows.length - 14 + i] - closes[closes.length - 15 + i] || lows[lows.length - 14 + i])
+                    ));
+                    const atr = tr.reduce((a, b) => a + b, 0) / tr.length;
+
+                    return [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr];
+                } catch (err) {
+                    addLog(`計算 ${ticker} 技術指標錯誤: ${err.message}`);
+                    return [null, null, null, null, null, null, null, null, null];
+                }
+            };
+
+            const monitorCryptos = async () => {
+                const newTableData = [];
+                const tickers = Object.keys(assets);
+                if (!tickers.length) {
+                    addLog("無加密貨幣可監聽");
+                    return;
+                }
+
+                const now = Date.now();
+                const oneDayMs = 24 * 60 * 60 * 1000;
+
+                for (const ticker of tickers) {
+                    try {
+                        const price = await getPriceWithFallback(ticker);
+                        if (price === null || price < 0.01) {
+                            addLog(`未獲取 ${ticker} 的有效價格: ${price}`);
+                            continue;
+                        }
+
+                        setAssets(prev => {
+                            const newAssets = { ...prev };
+                            const asset = newAssets[ticker];
+                            asset.prices = [...(asset.prices || []), { price, timestamp: now }];
+                            asset.prices = asset.prices.filter(p => now - p.timestamp <= oneDayMs);
+                            const prices = asset.prices.map(p => p.price);
+                            asset.high = prices.length > 0 ? Math.max(...prices) : price;
+                            asset.low = prices.length > 0 ? Math.min(...prices) : price;
+                            return newAssets;
+                        });
+
+                        const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr] = await calculateTechnicalIndicators(ticker);
+                        let buyScore = 0;
+                        const indicators = [];
+                        if (sma && price < sma) {
+                            buyScore += 30;
+                            indicators.push(`價格低於SMA: ${sma.toFixed(2)}`);
+                        }
+                        if (rsi && rsi < rsiThreshold) {
+                            buyScore += 30;
+                            indicators.push(`RSI超賣: ${rsi.toFixed(2)}`);
+                        }
+                        if (lowerBand && price < lowerBand) {
+                            buyScore += 20;
+                            indicators.push(`價格低於布林下軌: ${lowerBand.toFixed(2)}`);
+                        }
+                        if (macdDiff && macdDiff > 0) {
+                            buyScore += 20;
+                            indicators.push(`MACD看漲: ${macdDiff.toFixed(2)}`);
+                        }
+                        if (vwma && price < vwma) {
+                            buyScore += 20;
+                            indicators.push(`價格低於VWMA: ${vwma.toFixed(2)}`);
+                        }
+                        const sentimentScore = 75; // Simplified for crypto
+                        if (sentimentScore > 70) {
+                            buyScore += 20;
+                            indicators.push(`正面情緒: ${sentimentScore}`);
+                        }
+                        const buyMessage = buyScore >= buyScoreThreshold
+                            ? `強烈建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`
+                            : `暫不建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
+                        const stopLoss = support || (price - 2 * (atr || price * 0.05));
+                        newTableData.push({
+                            ticker,
+                            price,
+                            sma20,
+                            rsi,
+                            upperBand,
+                            lowerBand,
+                            macdDiff,
+                            vwma,
+                            buyScore,
+                            recommendation: buyMessage
+                        });
+                        addLog(`${ticker} 當前價格: ${price.toFixed(2)}, 買入建議: ${buyMessage}, 止損價格: ${stopLoss.toFixed(2)}, 24小時高位: ${assets[ticker]?.high?.toFixed(2)}, 24小時低位: ${assets[ticker]?.low?.toFixed(2)}`);
+                    } catch (err) {
+                        addLog(`處理 ${ticker} 錯誤: ${err.message}`);
+                    }
+                }
+                setTableData(newTableData);
+            };
+
+            const showChart = async (t) => {
+                if (!t) {
+                    addLog("未選擇加密貨幣，無法顯示圖表");
+                    setApiError("請選擇一個加密貨幣以顯示圖表");
+                    return;
+                }
+                setChartTicker(t);
+                setApiError("");
+                setIsLoadingChart(true);
+                addLog(`顯示 ${t} 的24小時折線圖`);
+
+                const asset = assets[t];
+                if (!asset || !asset.prices || asset.prices.length === 0) {
+                    const price = await getPriceWithFallback(t);
+                    if (price === null || price < 0.01) {
+                        addLog(`無法獲取 ${t} 的當前價格: ${price}`);
+                        setApiError(`沒有足夠的數據顯示 ${t} 的24小時價格走勢`);
+                        alert(`沒有足夠的數據顯示 ${t} 的24小時價格走勢`);
+                        setIsLoadingChart(false);
+                        return;
+                    }
+                    const now = Date.now();
+                    setAssets(prev => ({
+                        ...prev,
+                        [t]: {
+                            ...prev[t],
+                            prices: [{ price, timestamp: now }],
+                            type: 'crypto'
+                        }
+                    }));
+                }
+                const updatedAsset = assets[t] || { prices: [] };
+                if (updatedAsset.prices.length < 2) {
+                    addLog(`數據點不足 (${updatedAsset.prices.length})，需要至少2個點顯示 ${t} 的24小時價格走勢`);
+                    setApiError(`數據點不足，請等待更多價格數據（當前有 ${updatedAsset.prices.length} 個點）`);
+                    alert(`數據點不足，請等待更多價格數據（當前有 ${updatedAsset.prices.length} 個點）`);
+                    setIsLoadingChart(false);
+                    return;
+                }
+                const sortedPrices = [...updatedAsset.prices].sort((a, b) => a.timestamp - b.timestamp);
+                setChartData({
+                    datasets: [{
+                        label: `${t} 24小時價格走勢 (USD)`,
+                        data: sortedPrices.map(p => ({
+                            x: new Date(p.timestamp),
+                            y: p.price
+                        })),
+                        borderColor: "#4CAF50",
+                        fill: false,
+                        tension: 0.1
+                    }]
+                });
+                setIsLoadingChart(false);
+            };
+
+            return (
+                <div className="container mx-auto p-4">
+                    <h1 className="text-2xl font-bold mb-4">加密貨幣監聽器</h1>
+                    <div className="mb-4">
+                        <label className="block">加密貨幣代碼 (如 BTC-USD):</label>
+                        <input
+                            type="text"
+                            value={ticker}
+                            onChange={e => setTicker(e.target.value)}
+                            className="border p-2 w-64"
+                            placeholder="如 BTC-USD"
+                        />
+                        <button onClick={addCrypto} className="bg-blue-500 text-white p-2 ml-2">添加加密貨幣</button>
+                        <button onClick={() => { localStorage.removeItem("cryptoAssets"); setAssets({}); addLog("已清除所有資產數據"); }} className="bg-yellow-500 text-white p-2 ml-2">清除資產</button>
+                    </div>
+                    <div className="mb-4">
+                        <button onClick={() => setShowSettings(true)} className="bg-gray-500 text-white p-2 mr-2">設置</button>
+                        <button onClick={startMonitoring} disabled={isMonitoring} className="bg-green-500 text-white p-2 mr-2 disabled:bg-gray-300">開始監聽</button>
+                        <button onClick={stopMonitoring} disabled={!isMonitoring} className="bg-red-500 text-white p-2 disabled:bg-gray-300">停止監聽</button>
+                    </div>
+                    {showSettings && (
+                        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center">
+                            <div className="bg-white p-4 rounded">
+                                <h2 className="text-lg font-bold mb-2">設置</h2>
+                                <div className="mb-2">
+                                    <label>RSI 買入閾值 (&lt;):</label>
+                                    <input
+                                        type="number"
+                                        value={rsiThreshold}
+                                        onChange={e => setRsiThreshold(e.target.value)}
+                                        className="border p-1 ml-2"
+                                    />
+                                </div>
+                                <div className="mb-2">
+                                    <label>買入分數閾值 (≥):</label>
+                                    <input
+                                        type="number"
+                                        value={buyScoreThreshold}
+                                        onChange={e => setBuyScoreThreshold(e.target.value)}
+                                        className="border p-1 ml-2"
+                                    />
+                                </div>
+                                <button
+                                    onClick={() => setShowSettings(false)}
+                                    className="bg-blue-500 text-white p-2"
+                                >
+                                    保存
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    <div className="mb-4">
+                        <h2 className="text-lg font-bold">加密貨幣列表</h2>
+                        <ul className="border p-2 max-h-32 overflow-y-auto">
+                            {Object.keys(assets).map(t => (
+                                <li key={t} className="flex justify-between">
+                                    <span>{t}: 24小時高位={assets[t].high?.toFixed(2) || "N/A"}, 24小時低位={assets[t].low?.toFixed(2) || "N/A"}</span>
+                                    <button onClick={() => removeCrypto(t)} className="text-red-500">移除</button>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                    <div className="mb-4">
+                        <h2 className="text-lg font-bold">價格走勢</h2>
+                        {apiError && (
+                            <div className="text-red-500 mb-2">{apiError}</div>
+                        )}
+                        <div className="flex items-center mb-2">
+                            <select
+                                value={chartTicker}
+                                onChange={e => showChart(e.target.value)}
+                                className="border p-2 mr-2"
+                            >
+                                <option value="">選擇加密貨幣</option>
+                                {Object.keys(assets).map(t => (
+                                    <option key={t} value={t}>{t}</option>
+                                ))}
+                            </select>
+                        </div>
+                        {isLoadingChart && (
+                            <div className="text-blue-500 mb-2">正在加載圖表數據...</div>
+                        )}
+                        {chartData && (
+                            <canvas id="priceChart" className="mt-4" style={{ maxHeight: "400px" }}></canvas>
+                        )}
+                    </div>
+                    <div className="mb-4">
+                        <h2 className="text-lg font-bold">監聽數據</h2>
+                        <table className="w-full border-collapse border">
+                            <thead>
+                                <tr className="bg-gray-200">
+                                    <th className="border p-2">加密貨幣</th>
+                                    <th className="border p-2">當前價格</th>
+                                    <th className="border p-2">SMA20</th>
+                                    <th className="border p-2">RSI</th>
+                                    <th className="border p-2">布林上軌</th>
+                                    <th className="border p-2">布林下軌</th>
+                                    <th className="border p-2">MACD 差值</th>
+                                    <th className="border p-2">VWMA</th>
+                                    <th className="border p-2">買入分數</th>
+                                    <th className="border p-2">建議</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {tableData.map((row, index) => (
+                                    <tr key={index}>
+                                        <td className="border p-2">{row.ticker}</td>
+                                        <td className="border p-2">{row.price?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.sma20?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.rsi?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.upperBand?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.lowerBand?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.macdDiff?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.vwma?.toFixed(2)}</td>
+                                        <td className="border p-2">{row.buyScore}</td>
+                                        <td className="border p-2">{row.recommendation}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div>
+                        <h2 className="text-lg font-bold">日誌</h2>
+                        <div className="border p-2 max-h-48 overflow-y-auto bg-white">
+                            {logs.map((log, index) => (
+                                <div key={index}>{log}</div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const { createRoot } = ReactDOM;
+        const root = createRoot(document.getElementById("root"));
+        root.render(<CryptoMonitor />);
+    </script>
+</body>
+</html>
