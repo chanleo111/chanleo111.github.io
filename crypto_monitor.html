@@ -21,9 +21,10 @@
         const COINAPI_API_KEY = "cbc368b2-d678-4635-a623-4cda8462da3b"; // Replace with your valid CoinAPI key
         let coinAPIRequests = 0;
         const MAX_COINAPI_REQUESTS = 100;
-        const COINAPI_REQUEST_THRESHOLD = 95; // Switch to CoinGecko if requests ≥ 95
+        const COINAPI_REQUEST_THRESHOLD = 95;
         const ohlcCache = {};
-        const priceCache = {}; // Cache for recent prices
+        const priceCache = {};
+        const historicalCache = {};
 
         function CryptoMonitor() {
             const [ticker, setTicker] = useState("");
@@ -32,35 +33,34 @@
             const [logs, setLogs] = useState([]);
             const [isMonitoring, setIsMonitoring] = useState(false);
             const [rsiThreshold, setRsiThreshold] = useState(30);
-            const [buyScoreThreshold, setBuyScoreThreshold] = useState(80);
             const [chartTicker, setChartTicker] = useState("");
-            const [chartData, setChartData] = useState(null);
+            const [chartStartTime, setChartStartTime] = useState("2025-05-23T09:00");
+            const [zScoreData, setZScoreData] = useState(null);
+            const [latestZScores, setLatestZScores] = useState({}); // New state for latest Z-scores
             const [coins, setCoins] = useState(null);
             const [showSettings, setShowSettings] = useState(false);
             const [apiError, setApiError] = useState("");
             const [isLoadingChart, setIsLoadingChart] = useState(false);
-            const [apiStatus, setApiStatus] = useState(""); // Track API usage status
+            const [apiStatus, setApiStatus] = useState("");
+            const [coinGeckoApiKey, setCoinGeckoApiKey] = useState(localStorage.getItem("coinGeckoApiKey") || "");
 
             useEffect(() => {
                 const fetchCoins = async (retries = 3) => {
                     for (let i = 0; i < retries; i++) {
                         try {
-                            const res = await fetch(`${COINGECKO_API_BASE}/coins/list`);
+                            const headers = coinGeckoApiKey ? { "x-cg-pro-api-key": coinGeckoApiKey } : {};
+                            const res = await fetch(`${COINGECKO_API_BASE}/coins/list`, { headers });
                             if (!res.ok) {
                                 throw new Error(`狀態碼: ${res.status}`);
                             }
                             const data = await res.json();
                             const coinMap = {};
                             const symbolCounts = {};
-                            const ethEntries = [];
                             data.forEach(item => {
                                 if (!item.symbol || !item.id) return;
                                 const symbol = item.symbol.toUpperCase() + "-USD";
                                 coinMap[symbol] = item.id;
                                 symbolCounts[symbol] = (symbolCounts[symbol] || 0) + 1;
-                                if (item.symbol.toUpperCase() === "ETH") {
-                                    ethEntries.push({ id: item.id, symbol: item.symbol, name: item.name });
-                                }
                             });
                             const priorityCoins = {
                                 "ETH-USD": "ethereum",
@@ -74,7 +74,6 @@
                             });
                             setCoins(coinMap);
                             addLog(`成功初始化 ${Object.keys(coinMap).length} 個加密貨幣對`);
-                            addLog(`ETH-USD 映射: ${coinMap["ETH-USD"] || "未找到"}`);
                             return;
                         } catch (err) {
                             addLog(`獲取加密貨幣對錯誤 (嘗試 ${i + 1}/${retries}): ${err.message}`);
@@ -86,11 +85,12 @@
                     }
                 };
                 fetchCoins();
-            }, []);
+            }, [coinGeckoApiKey]);
 
             useEffect(() => {
                 localStorage.setItem("cryptoAssets", JSON.stringify(assets));
-            }, [assets]);
+                localStorage.setItem("coinGeckoApiKey", coinGeckoApiKey);
+            }, [assets, coinGeckoApiKey]);
 
             useEffect(() => {
                 let interval;
@@ -102,15 +102,15 @@
             }, [isMonitoring, coins]);
 
             useEffect(() => {
-                const canvas = document.getElementById("priceChart");
-                if (canvas && chartData) {
+                const canvas = document.getElementById("zScoreChart");
+                if (canvas && zScoreData) {
                     const ctx = canvas.getContext("2d");
                     if (canvas.chart) {
                         canvas.chart.destroy();
                     }
                     canvas.chart = new Chart(ctx, {
                         type: "line",
-                        data: chartData,
+                        data: zScoreData,
                         options: {
                             plugins: {
                                 legend: { display: true }
@@ -119,16 +119,21 @@
                                 x: {
                                     type: "time",
                                     time: {
-                                        unit: "hour",
+                                        unit: "minute",
                                         displayFormats: {
+                                            minute: "HH:mm",
                                             hour: "HH:mm",
                                             day: "YYYY-MM-DD"
-                                        }
+                                        },
+                                        min: new Date(chartStartTime + "+08:00"),
+                                        max: new Date()
                                     }
                                 },
                                 y: {
                                     beginAtZero: false,
-                                    title: { display: true, text: "價格 (USD)" }
+                                    title: { display: true, text: "Z分數" },
+                                    suggestedMin: -3,
+                                    suggestedMax: 3
                                 }
                             },
                             interaction: {
@@ -143,7 +148,7 @@
                         canvas.chart.destroy();
                     }
                 };
-            }, [chartData]);
+            }, [zScoreData, chartStartTime]);
 
             const addLog = (message) => {
                 const timestamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" });
@@ -184,6 +189,11 @@
                     delete newAssets[ticker];
                     return newAssets;
                 });
+                setLatestZScores(prev => {
+                    const newZScores = { ...prev };
+                    delete newZScores[ticker];
+                    return newZScores;
+                });
                 addLog(`移除加密貨幣 ${ticker}`);
             };
 
@@ -219,8 +229,6 @@
                     const res = await fetch(url);
                     if (res.status === 429) {
                         addLog(`CoinAPI 配額超限 (429)`);
-                        setApiError("CoinAPI 配額超限，切換到 CoinGecko");
-                        setApiStatus("CoinAPI 配額超限，使用 CoinGecko");
                         return null;
                     }
                     if (!res.ok) {
@@ -248,16 +256,16 @@
                     addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
                     return null;
                 }
-                // Check cache first
                 const cacheKey = ticker;
-                if (priceCache[cacheKey] && Date.now() - priceCache[cacheKey].timestamp < 5 * 60 * 1000) {
+                if (priceCache[cacheKey] && Date.now() - priceCache[cacheKey].timestamp < 1 * 60 * 1000) {
                     addLog(`使用緩存的 ${ticker} 價格: ${priceCache[cacheKey].price}`);
                     return priceCache[cacheKey].price;
                 }
                 try {
+                    const headers = coinGeckoApiKey ? { "x-cg-pro-api-key": coinGeckoApiKey } : {};
                     const url = `${COINGECKO_API_BASE}/simple/price?ids=${coins[ticker]}&vs_currencies=usd`;
                     addLog(`發送 CoinGecko 價格請求: ${url}`);
-                    const res = await fetch(url);
+                    const res = await fetch(url, { headers });
                     if (res.status === 429) {
                         addLog(`CoinGecko API 配額超限 (429)`);
                         setApiError("CoinGecko 配額超限，請稍後重試");
@@ -290,35 +298,118 @@
                 return await getCoinGeckoPrice(ticker);
             };
 
-            const getCoinGeckoHistoricalData = async (ticker) => {
+            const getCoinGeckoHistoricalData = async (ticker, days = 1, startTime) => {
                 if (!coins || !coins[ticker]) {
                     addLog(`無效 ticker: ${ticker}，未在 coins 中找到`);
                     return [];
                 }
+                const cacheKey = `${ticker}_${days}d_${startTime}`;
+                if (historicalCache[cacheKey] && Date.now() - historicalCache[cacheKey].timestamp < 5 * 60 * 1000) {
+                    addLog(`使用緩存的 ${ticker} 歷史數據: ${historicalCache[cacheKey].data.length} 條記錄`);
+                    return historicalCache[cacheKey].data;
+                }
+                const maxRetries = 3;
+                for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                    try {
+                        const headers = coinGeckoApiKey ? { "x-cg-pro-api-key": coinGeckoApiKey } : {};
+                        const url = `${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=${days}&interval=minute`;
+                        addLog(`發送 CoinGecko 歷史數據請求 (嘗試 ${attempt}/${maxRetries}): ${url}, 開始時間: ${new Date(startTime).toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })}`);
+                        const res = await fetch(url, { headers });
+                        if (res.status === 429) {
+                            addLog(`CoinGecko API 配額超限 (429)`);
+                            setApiError("CoinGecko 配額超限，請稍後重試或提供 API 密鑰");
+                            await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                            continue;
+                        }
+                        if (res.status === 401) {
+                            addLog(`CoinGecko 歷史數據請求失敗，狀態碼: 401 (未授權，可能需要 API 密鑰)`);
+                            await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                            continue;
+                        }
+                        if (!res.ok) {
+                            addLog(`CoinGecko 歷史數據請求失敗，狀態碼: ${res.status}`);
+                            setApiError(`CoinGecko 歷史數據請求失敗 (狀態碼: ${res.status})`);
+                            await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                            continue;
+                        }
+                        const data = await res.json();
+                        addLog(`CoinGecko 歷史數據原始響應: ${ticker}, 價格數據點數: ${data.prices?.length || 0}`);
+                        const startTimestamp = new Date(startTime).getTime();
+                        let prices = data.prices
+                            ?.map(([timestamp, price]) => ({
+                                timestamp,
+                                price
+                            }))
+                            .filter(p => p.price && p.timestamp >= startTimestamp)
+                            .sort((a, b) => a.timestamp - b.timestamp) || [];
+                        addLog(`獲取 ${ticker} 從 ${new Date(startTimestamp).toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })} 至今歷史數據: ${prices.length} 條記錄 (days=${days})`);
+
+                        if (prices.length < 2 && days < 3) {
+                            addLog(`數據不足 (${prices.length} 條記錄)，嘗試獲取 ${ticker} ${days + 1}天歷史數據`);
+                            return await getCoinGeckoHistoricalData(ticker, days + 1, startTime);
+                        }
+
+                        historicalCache[cacheKey] = { data: prices, timestamp: Date.now() };
+                        return prices;
+                    } catch (err) {
+                        addLog(`獲取 ${ticker} CoinGecko 歷史數據錯誤 (嘗試 ${attempt}/${maxRetries}): ${err.message}`);
+                        setApiError(`CoinGecko 歷史數據錯誤: ${err.message}`);
+                        if (attempt < maxRetries) {
+                            await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                        }
+                    }
+                }
+                addLog(`CoinGecko 歷史數據請求失敗，嘗試 CoinAPI 後備`);
+                return await getCoinAPIHistoricalData(ticker, days, startTime);
+            };
+
+            const getCoinAPIHistoricalData = async (ticker, days, startTime) => {
+                if (!ticker.endsWith("-USD")) {
+                    addLog(`CoinAPI 不支持非 USD 貨幣對: ${ticker}`);
+                    return [];
+                }
+                if (COINAPI_API_KEY === "YOUR_COINAPI_KEY") {
+                    addLog("CoinAPI 密鑰未配置，無法獲取歷史數據");
+                    setApiError("CoinAPI 密鑰未配置，請設置有效的 COINAPI_API_KEY");
+                    return [];
+                }
                 try {
-                    const url = `${COINGECKO_API_BASE}/coins/${coins[ticker]}/market_chart?vs_currency=usd&days=1&interval=hourly`;
-                    addLog(`發送 CoinGecko 歷史數據請求: ${url}`);
+                    const [base] = ticker.split("-USD");
+                    const period_id = "1MIN";
+                    const time_start = new Date(startTime).toISOString();
+                    const time_end = new Date().toISOString();
+                    const url = `https://rest.coinapi.io/v1/ohlcv/${base}/USD/history?apikey=${COINAPI_API_KEY}&period_id=${period_id}&time_start=${time_start}&time_end=${time_end}&limit=1000`;
+                    addLog(`發送 CoinAPI 歷史數據請求: ${url}`);
                     const res = await fetch(url);
                     if (res.status === 429) {
-                        addLog(`CoinGecko API 配額超限 (429)`);
-                        setApiError("CoinGecko 配額超限，請稍後重試");
+                        addLog(`CoinAPI 配額超限 (429)`);
+                        setApiError("CoinAPI 配額超限，請稍後重試");
                         return [];
                     }
                     if (!res.ok) {
-                        addLog(`CoinGecko 歷史數據請求失敗，狀態碼: ${res.status}`);
-                        setApiError(`CoinGecko 歷史數據請求失敗 (狀態碼: ${res.status})`);
+                        addLog(`CoinAPI 歷史數據請求失敗，狀態碼: ${res.status}`);
+                        setApiError(`CoinAPI 歷史數據請求失敗 (狀態碼: ${res.status})`);
                         return [];
                     }
                     const data = await res.json();
-                    const prices = data.prices.map(([timestamp, price]) => ({
-                        timestamp,
-                        price
-                    })).filter(p => p.price);
-                    addLog(`獲取 ${ticker} 24小時歷史數據: ${prices.length} 條記錄`);
+                    const prices = data
+                        .map(item => ({
+                            timestamp: new Date(item.time_period_start).getTime(),
+                            price: item.price_close
+                        }))
+                        .filter(p => p.price && p.timestamp >= new Date(startTime).getTime())
+                        .sort((a, b) => a.timestamp - b.timestamp);
+                    addLog(`獲取 ${ticker} CoinAPI 歷史數據: ${prices.length} 條記錄`);
+                    coinAPIRequests++;
+                    if (coinAPIRequests >= COINAPI_REQUEST_THRESHOLD) {
+                        setApiStatus("接近 CoinAPI 配額上限，切換到 CoinGecko");
+                    }
+                    const cacheKey = `${ticker}_${days}d_${startTime}`;
+                    historicalCache[cacheKey] = { data: prices, timestamp: Date.now() };
                     return prices;
                 } catch (err) {
-                    addLog(`獲取 ${ticker} CoinGecko 歷史數據錯誤: ${err.message}`);
-                    setApiError(`CoinGecko 歷史數據錯誤: ${err.message}`);
+                    addLog(`獲取 ${ticker} CoinAPI 歷史數據錯誤: ${err.message}`);
+                    setApiError(`CoinAPI 歷史數據錯誤: ${err.message}`);
                     return [];
                 }
             };
@@ -334,12 +425,18 @@
                     return ohlcCache[cacheKey].data;
                 }
                 try {
+                    const headers = coinGeckoApiKey ? { "x-cg-pro-api-key": coinGeckoApiKey } : {};
                     const url = `${COINGECKO_API_BASE}/coins/${coins[ticker]}/ohlc?vs_currency=usd&days=${days}`;
                     addLog(`發送 CoinGecko OHLC 請求: ${url}`);
-                    const res = await fetch(url);
+                    const res = await fetch(url, { headers });
                     if (res.status === 429) {
                         addLog(`CoinGecko API 配額超限 (429)`);
                         setApiError("CoinGecko 配額超限，請稍後重試");
+                        return [];
+                    }
+                    if (res.status === 401) {
+                        addLog(`CoinGecko OHLC 請求失敗，狀態碼: 401 (未授權，可能需要 API 密鑰)`);
+                        setApiError("CoinGecko 要求 API 密鑰，請在設置中輸入有效密鑰");
                         return [];
                     }
                     if (!res.ok) {
@@ -367,12 +464,34 @@
                 }
             };
 
+            const calculateZScore = (prices, currentPrice = null) => {
+                if (prices.length < 2) {
+                    addLog(`Z分數計算失敗: 價格數據點數 ${prices.length} 不足2個`);
+                    return currentPrice !== null ? 0 : prices.map(p => ({ ...p, zScore: 0 }));
+                }
+                const priceValues = prices.map(p => p.price);
+                const mean = priceValues.reduce((a, b) => a + b, 0) / priceValues.length;
+                const variance = priceValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / priceValues.length;
+                const stdDev = Math.sqrt(variance) || 1;
+                if (currentPrice !== null) {
+                    const zScore = (currentPrice - mean) / stdDev;
+                    addLog(`Z分數計算: 當前價格=${currentPrice}, 均值=${mean}, 標準差=${stdDev}, Z分數=${zScore}`);
+                    return zScore;
+                }
+                return prices.map(p => ({
+                    ...p,
+                    zScore: (p.price - mean) / stdDev
+                }));
+            };
+
             const calculateTechnicalIndicators = async (ticker) => {
                 try {
                     const ohlcData = await getCoinGeckoOHLCData(ticker, 30);
+                    const historicalPrices = await getCoinGeckoHistoricalData(ticker, 1, chartStartTime + "+08:00");
+                    addLog(`計算 ${ticker} 技術指標，歷史數據點數: ${historicalPrices.length}`);
                     if (!ohlcData.length) {
                         addLog(`無法計算 ${ticker} 技術指標，無 OHLC 數據`);
-                        return [null, null, null, null, null, null, null, null, null];
+                        return [null, null, null, null, null, null, null, null, null, 0];
                     }
                     const closes = ohlcData.map(d => d.c);
                     const volumes = ohlcData.map(d => d.volume || 1);
@@ -422,10 +541,19 @@
                     ));
                     const atr = tr.reduce((a, b) => a + b, 0) / tr.length;
 
-                    return [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr];
+                    let zScore = 0;
+                    if (historicalPrices.length >= 2) {
+                        const latestPrice = historicalPrices[historicalPrices.length - 1].price;
+                        zScore = calculateZScore(historicalPrices, latestPrice);
+                        addLog(`計算 ${ticker} 最新價格 Z分數: ${zScore.toFixed(2)}`);
+                    } else {
+                        addLog(`無法計算 ${ticker} Z分數: 歷史數據點數 ${historicalPrices.length} 不足2個，使用默認值 0`);
+                    }
+
+                    return [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr, zScore];
                 } catch (err) {
                     addLog(`計算 ${ticker} 技術指標錯誤: ${err.message}`);
-                    return [null, null, null, null, null, null, null, null, null];
+                    return [null, null, null, null, null, null, null, null, null, 0];
                 }
             };
 
@@ -459,37 +587,23 @@
                             return newAssets;
                         });
 
-                        const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr] = await calculateTechnicalIndicators(ticker);
-                        let buyScore = 0;
-                        const indicators = [];
-                        if (sma && price < sma) {
-                            buyScore += 30;
-                            indicators.push(`價格低於SMA: ${sma.toFixed(2)}`);
+                        const [sma, rsi, upperBand, lowerBand, macdDiff, support, sma20, vwma, atr, zScore] = await calculateTechnicalIndicators(ticker);
+                        let finalZScore = zScore;
+                        let recommendation;
+
+                        if (zScore === 0 && latestZScores[ticker] !== undefined) {
+                            finalZScore = latestZScores[ticker];
+                            addLog(`API 未獲取 ${ticker} 數據，使用 Z分數圖表最新 Z分數: ${finalZScore.toFixed(2)}`);
                         }
-                        if (rsi && rsi < rsiThreshold) {
-                            buyScore += 30;
-                            indicators.push(`RSI超賣: ${rsi.toFixed(2)}`);
+
+                        if (finalZScore <= -2) {
+                            recommendation = `強烈建議買入 (Z分數: ${finalZScore.toFixed(2)})`;
+                        } else if (finalZScore >= 2) {
+                            recommendation = `強烈建議賣出 (Z分數: ${finalZScore.toFixed(2)})`;
+                        } else {
+                            recommendation = `暫不建議操作 (Z分數: ${finalZScore.toFixed(2)})`;
                         }
-                        if (lowerBand && price < lowerBand) {
-                            buyScore += 20;
-                            indicators.push(`價格低於布林下軌: ${lowerBand.toFixed(2)}`);
-                        }
-                        if (macdDiff && macdDiff > 0) {
-                            buyScore += 20;
-                            indicators.push(`MACD看漲: ${macdDiff.toFixed(2)}`);
-                        }
-                        if (vwma && price < vwma) {
-                            buyScore += 20;
-                            indicators.push(`價格低於VWMA: ${vwma.toFixed(2)}`);
-                        }
-                        const sentimentScore = 75; // Simplified for crypto
-                        if (sentimentScore > 70) {
-                            buyScore += 20;
-                            indicators.push(`正面情緒: ${sentimentScore}`);
-                        }
-                        const buyMessage = buyScore >= buyScoreThreshold
-                            ? `強烈建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`
-                            : `暫不建議買入 (分數: ${buyScore}, ${indicators.join(", ")})`;
+
                         const stopLoss = support || (price - 2 * (atr || price * 0.05));
                         newTableData.push({
                             ticker,
@@ -500,10 +614,10 @@
                             lowerBand,
                             macdDiff,
                             vwma,
-                            buyScore,
-                            recommendation: buyMessage
+                            zScore: finalZScore,
+                            recommendation
                         });
-                        addLog(`${ticker} 當前價格: ${price.toFixed(2)}, 買入建議: ${buyMessage}, 止損價格: ${stopLoss.toFixed(2)}, 24小時高位: ${assets[ticker]?.high?.toFixed(2)}, 24小時低位: ${assets[ticker]?.low?.toFixed(2)}`);
+                        addLog(`${ticker} 當前價格: ${price.toFixed(2)}, 建議: ${recommendation}, 止損價格: ${stopLoss.toFixed(2)}, 24小時高位: ${assets[ticker]?.high?.toFixed(2)}, 24小時低位: ${assets[ticker]?.low?.toFixed(2)}, Z分數: ${finalZScore.toFixed(2)}`);
                     } catch (err) {
                         addLog(`處理 ${ticker} 錯誤: ${err.message}`);
                     }
@@ -517,29 +631,50 @@
                     setApiError("請選擇一個加密貨幣以顯示圖表");
                     return;
                 }
+                const startTime = new Date(chartStartTime + "+08:00");
+                const now = new Date();
+                if (startTime > now) {
+                    addLog(`無效的開始時間: ${startTime.toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })} 在當前時間之後`);
+                    setApiError("請選擇當前時間之前的日期和時間");
+                    return;
+                }
                 setChartTicker(t);
                 setApiError("");
                 setIsLoadingChart(true);
-                addLog(`顯示 ${t} 的24小時折線圖`);
+                addLog(`顯示 ${t} 的從 ${startTime.toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })} 至今Z分數圖表`);
+
+                const startTimestamp = startTime.getTime();
+
+                const latestPrice = await getPriceWithFallback(t);
+                if (latestPrice !== null && latestPrice >= 0.01) {
+                    setAssets(prev => {
+                        const newAssets = { ...prev };
+                        const asset = newAssets[t] || { prices: [], type: "crypto" };
+                        asset.prices = [...(asset.prices || []), { price: latestPrice, timestamp: now.getTime() }]
+                            .filter(p => p.timestamp >= startTimestamp && p.timestamp <= now.getTime());
+                        return { ...newAssets, [t]: asset };
+                    });
+                    addLog(`獲取 ${t} 最新價格: ${latestPrice} at ${new Date().toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })}`);
+                }
 
                 let prices = [];
                 const asset = assets[t];
                 if (asset && asset.prices && asset.prices.length >= 2) {
-                    prices = [...asset.prices].sort((a, b) => a.timestamp - b.timestamp);
+                    prices = [...asset.prices]
+                        .filter(p => p.timestamp >= startTimestamp && p.timestamp <= now.getTime())
+                        .sort((a, b) => a.timestamp - b.timestamp);
                     addLog(`使用實時價格數據顯示 ${t} 圖表: ${prices.length} 個數據點`);
                 } else {
-                    // Fetch historical data from CoinGecko
                     addLog(`實時數據不足 (${asset?.prices?.length || 0} 個數據點)，獲取 ${t} 歷史數據`);
-                    const historicalPrices = await getCoinGeckoHistoricalData(t);
+                    const historicalPrices = await getCoinGeckoHistoricalData(t, 1, chartStartTime + "+08:00");
                     if (historicalPrices.length < 2) {
                         addLog(`無法獲取 ${t} 的歷史數據: ${historicalPrices.length} 個數據點`);
-                        setApiError(`沒有足夠的數據顯示 ${t} 的24小時價格走勢`);
-                        alert(`沒有足夠的數據顯示 ${t} 的24小時價格走勢`);
+                        setApiError(`沒有足夠的數據顯示 ${t} 的從 ${startTime.toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })} 至今Z分數走勢`);
+                        alert(`沒有足夠的數據顯示 ${t} 的從 ${startTime.toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })} 至今Z分數走勢`);
                         setIsLoadingChart(false);
                         return;
                     }
                     prices = historicalPrices;
-                    // Update assets with historical data to prevent repeated fetches
                     setAssets(prev => ({
                         ...prev,
                         [t]: {
@@ -550,18 +685,35 @@
                     }));
                 }
 
-                setChartData({
+                if (prices.length > 0) {
+                    const latestTimestamp = new Date(prices[prices.length - 1].timestamp).toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" });
+                    addLog(`圖表數據最新時間戳: ${latestTimestamp}`);
+                }
+
+                const zScorePrices = calculateZScore(prices);
+                addLog(`計算 ${t} 的Z分數: ${zScorePrices.length} 個數據點`);
+
+                // Store the latest Z-score for this ticker
+                const latestZScore = zScorePrices.length > 0 ? zScorePrices[zScorePrices.length - 1].zScore : 0;
+                setLatestZScores(prev => ({
+                    ...prev,
+                    [t]: latestZScore
+                }));
+                addLog(`更新 ${t} 最新 Z分數: ${latestZScore.toFixed(2)}`);
+
+                setZScoreData({
                     datasets: [{
-                        label: `${t} 24小時價格走勢 (USD)`,
-                        data: prices.map(p => ({
+                        label: `${t} 從 ${startTime.toLocaleString("zh-TW", { timeZone: "Asia/Hong_Kong" })} 至今Z分數`,
+                        data: zScorePrices.map(p => ({
                             x: new Date(p.timestamp),
-                            y: p.price
+                            y: p.zScore
                         })),
-                        borderColor: "#4CAF50",
+                        borderColor: "#FF5733",
                         fill: false,
                         tension: 0.1
                     }]
                 });
+
                 setIsLoadingChart(false);
             };
 
@@ -578,7 +730,7 @@
                             placeholder="如 BTC-USD"
                         />
                         <button onClick={addCrypto} className="bg-blue-500 text-white p-2 ml-2">添加加密貨幣</button>
-                        <button onClick={() => { localStorage.removeItem("cryptoAssets"); setAssets({}); addLog("已清除所有資產數據"); }} className="bg-yellow-500 text-white p-2 ml-2">清除資產</button>
+                        <button onClick={() => { localStorage.removeItem("cryptoAssets"); setAssets({}); setLatestZScores({}); addLog("已清除所有資產數據"); }} className="bg-yellow-500 text-white p-2 ml-2">清除資產</button>
                     </div>
                     <div className="mb-4">
                         <button onClick={() => setShowSettings(true)} className="bg-gray-500 text-white p-2 mr-2">設置</button>
@@ -599,12 +751,13 @@
                                     />
                                 </div>
                                 <div className="mb-2">
-                                    <label>買入分數閾值 (≥):</label>
+                                    <label>CoinGecko API 密鑰 (可選):</label>
                                     <input
-                                        type="number"
-                                        value={buyScoreThreshold}
-                                        onChange={e => setBuyScoreThreshold(e.target.value)}
-                                        className="border p-1 ml-2"
+                                        type="text"
+                                        value={coinGeckoApiKey}
+                                        onChange={e => setCoinGeckoApiKey(e.target.value)}
+                                        className="border p-1 ml-2 w-64"
+                                        placeholder="輸入 CoinGecko Pro API 密鑰"
                                     />
                                 </div>
                                 <button
@@ -628,7 +781,7 @@
                         </ul>
                     </div>
                     <div className="mb-4">
-                        <h2 className="text-lg font-bold">價格走勢</h2>
+                        <h2 className="text-lg font-bold">Z分數走勢</h2>
                         {apiError && (
                             <div className="text-red-500 mb-2">{apiError}</div>
                         )}
@@ -646,12 +799,22 @@
                                     <option key={t} value={t}>{t}</option>
                                 ))}
                             </select>
+                            <input
+                                type="datetime-local"
+                                value={chartStartTime}
+                                onChange={e => setChartStartTime(e.target.value)}
+                                className="border p-2"
+                                max="2025-05-23T14:54"
+                            />
                         </div>
                         {isLoadingChart && (
                             <div className="text-blue-500 mb-2">正在加載圖表數據...</div>
                         )}
-                        {chartData && (
-                            <canvas id="priceChart" className="mt-4" style={{ maxHeight: "400px" }}></canvas>
+                        {zScoreData && (
+                            <div className="mb-4">
+                                <h3 className="text-md font-semibold">Z分數走勢</h3>
+                                <canvas id="zScoreChart" className="mt-2" style={{ maxHeight: "400px" }}></canvas>
+                            </div>
                         )}
                     </div>
                     <div className="mb-4">
@@ -667,7 +830,7 @@
                                     <th className="border p-2">布林下軌</th>
                                     <th className="border p-2">MACD 差值</th>
                                     <th className="border p-2">VWMA</th>
-                                    <th className="border p-2">買入分數</th>
+                                    <th className="border p-2">Z分數</th>
                                     <th className="border p-2">建議</th>
                                 </tr>
                             </thead>
@@ -682,7 +845,7 @@
                                         <td className="border p-2">{row.lowerBand?.toFixed(2)}</td>
                                         <td className="border p-2">{row.macdDiff?.toFixed(2)}</td>
                                         <td className="border p-2">{row.vwma?.toFixed(2)}</td>
-                                        <td className="border p-2">{row.buyScore}</td>
+                                        <td className="border p-2">{row.zScore?.toFixed(2) ?? "N/A"}</td>
                                         <td className="border p-2">{row.recommendation}</td>
                                     </tr>
                                 ))}
