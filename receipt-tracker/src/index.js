@@ -1,8 +1,9 @@
-import { HashRouter } from 'react-router-dom';
-
-ReactDOM.render(
+import { HashRouter , Routes, Route} from 'react-router-dom';
+function App() {
+  return (
   <HashRouter>
     <App />
   </HashRouter>,
   document.getElementById('root')
-);
+ );
+}

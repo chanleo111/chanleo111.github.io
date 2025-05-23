@@ -1,3 +1,5 @@
+
+import 'core-js-pure/stable';
 import React from 'react';
 import ReactDOM from 'react-dom';
 import { HashRouter  as Router } from 'react-router-dom';
