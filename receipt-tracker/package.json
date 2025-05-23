@@ -1,5 +1,5 @@
 {
-  "homepage": "https://https://chanleo111.github.io/receipt-tracker",
+  "homepage": "https://chanleo111.github.io/receipt-tracker",
 "scripts": {
   "predeploy": "npm run build",
   "deploy": "gh-pages -d build"
